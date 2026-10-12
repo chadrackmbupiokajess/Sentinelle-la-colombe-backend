@@ -149,17 +149,16 @@ class Diffuseur:
     def equipe(self) -> list[str]:
         return sorted({c["nom"] for c in self.soignants.values()}, key=str.lower)
 
-    def contacts_connectes(self) -> list[dict]:
-        contacts = {
-            c["id"]: {
-                "id": c["id"],
-                "nom": c["nom"],
-                "role": "medecin" if c["role"] in ("medecin", "admin") else "infirmier",
-            }
-            for c in self.soignants.values()
-            if c["role"] in ("infirmier", "medecin", "admin")
+    def contacts_medicaux(self) -> list[dict]:
+        comptes_connectes = {
+            compte["id"]
+            for compte in self.soignants.values()
+            if compte["role"] in ("infirmier", "medecin", "admin")
         }
-        return sorted(contacts.values(), key=lambda c: c["nom"].lower())
+        return [
+            {**contact, "en_ligne": contact["id"] in comptes_connectes}
+            for contact in base.contacts_medicaux()
+        ]
 
     def etat_soignants(self) -> dict:
         return {
@@ -167,7 +166,7 @@ class Diffuseur:
             "alertes": base.alertes_visibles(),
             "chambres": base.lister_chambres(avec_sejours=True),
             "equipe": self.equipe(),
-            "contacts_connectes": self.contacts_connectes(),
+            "contacts_medicaux": self.contacts_medicaux(),
             "stats": base.statistiques(),
             "heure_serveur": maintenant().isoformat(timespec="milliseconds"),
         }
@@ -413,8 +412,8 @@ def partenaire_medical(compte: dict, autre_id: int) -> dict:
     if not autre or autre["statut"] != "actif":
         raise ErreurMetier("Ce compte est introuvable ou indisponible.", 404)
     role_autre = role_medical(autre["role"])
-    if role_autre is None or (role_compte == "infirmier" and role_autre == "infirmier"):
-        raise ErreurMetier("La messagerie privée relie un médecin à un médecin ou à un infirmier.", 403)
+    if role_autre is None:
+        raise ErreurMetier("La messagerie privée est réservée aux médecins et infirmiers.", 403)
     return autre
 
 

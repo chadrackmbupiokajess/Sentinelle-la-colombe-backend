@@ -241,6 +241,22 @@ class Base:
         with self.verrou:
             return _compte_public(self._un("SELECT * FROM comptes WHERE id = ?", (compte_id,)))
 
+    def contacts_medicaux(self) -> list[dict]:
+        with self.verrou:
+            lignes = self._plusieurs(
+                "SELECT id, nom, role FROM comptes "
+                "WHERE statut = 'actif' AND role IN ('infirmier', 'medecin', 'admin') "
+                "ORDER BY nom COLLATE NOCASE"
+            )
+        return [
+            {
+                "id": ligne["id"],
+                "nom": ligne["nom"],
+                "role": "medecin" if ligne["role"] in ("medecin", "admin") else "infirmier",
+            }
+            for ligne in lignes
+        ]
+
     def inscrire(self, identifiant: str, nom: str, mot_de_passe: str) -> tuple[dict, bool]:
         """Crée une demande de compte. Le tout premier compte devient administrateur, actif."""
         identifiant = identifiant.strip().lower()
