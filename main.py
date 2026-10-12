@@ -410,8 +410,9 @@ def partenaire_medical(compte: dict, autre_id: int) -> dict:
     autre = base.compte(autre_id)
     if not autre or autre["statut"] != "actif":
         raise ErreurMetier("Ce compte est introuvable ou indisponible.", 404)
-    if role_medical(autre["role"]) is None or role_medical(autre["role"]) == role_compte:
-        raise ErreurMetier("La messagerie privée relie un médecin et un infirmier.", 403)
+    role_autre = role_medical(autre["role"])
+    if role_autre is None or (role_compte == "infirmier" and role_autre == "infirmier"):
+        raise ErreurMetier("La messagerie privée relie un médecin à un médecin ou à un infirmier.", 403)
     return autre
 
 
