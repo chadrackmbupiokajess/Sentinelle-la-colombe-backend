@@ -141,7 +141,10 @@ class Base:
                     destinataire_id INTEGER NOT NULL REFERENCES comptes(id),
                     texte           TEXT NOT NULL,
                     cree_le         TEXT NOT NULL,
-                    lu_le           TEXT
+                    lu_le           TEXT,
+                    type            TEXT NOT NULL DEFAULT 'texte',
+                    audio           BLOB,
+                    audio_type      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_expediteur
                     ON messages_prives(expediteur_id, destinataire_id, id);
@@ -204,6 +207,9 @@ class Base:
             ajouter_colonne("alertes", "sejour_id", "TEXT")
             ajouter_colonne("sejours", "sortie_prevue", "TEXT")
             ajouter_colonne("messages_prives", "lu_le", "TEXT")
+            ajouter_colonne("messages_prives", "type", "TEXT NOT NULL DEFAULT 'texte'")
+            ajouter_colonne("messages_prives", "audio", "BLOB")
+            ajouter_colonne("messages_prives", "audio_type", "TEXT")
             if self.cx.execute("SELECT COUNT(*) FROM chambres").fetchone()[0] == 0:
                 self.cx.executemany(
                     "INSERT INTO chambres (id, libelle, service) VALUES (?, ?, ?)",
@@ -848,7 +854,7 @@ class Base:
         with self.verrou:
             lignes = self._plusieurs(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
-                "m.destinataire_id, m.texte, m.cree_le, m.lu_le "
+                "m.destinataire_id, m.texte, m.cree_le, m.lu_le, m.type, m.audio_type "
                 "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
                 "WHERE (m.expediteur_id = ? AND m.destinataire_id = ?) "
                 "OR (m.expediteur_id = ? AND m.destinataire_id = ?) "
@@ -871,10 +877,40 @@ class Base:
             )
             return self._un(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
-                "m.destinataire_id, m.texte, m.cree_le, m.lu_le "
+                "m.destinataire_id, m.texte, m.cree_le, m.lu_le, m.type, m.audio_type "
                 "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
                 "WHERE m.id = ?",
                 (cur.lastrowid,),
+            )
+
+    def ajouter_vocal_prive(
+        self, expediteur_id: int, destinataire_id: int, audio: bytes, audio_type: str
+    ) -> dict:
+        if not audio:
+            raise ErreurMetier("L'enregistrement vocal est vide.")
+        with self.verrou, self.cx:
+            cur = self.cx.execute(
+                "INSERT INTO messages_prives "
+                "(expediteur_id, destinataire_id, texte, cree_le, type, audio, audio_type) "
+                "VALUES (?, ?, '', ?, 'audio', ?, ?)",
+                (expediteur_id, destinataire_id, horodatage(), sqlite3.Binary(audio), audio_type),
+            )
+            return self._un(
+                "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
+                "m.destinataire_id, m.texte, m.cree_le, m.lu_le, m.type, m.audio_type "
+                "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
+                "WHERE m.id = ?",
+                (cur.lastrowid,),
+            )
+
+    def vocal_prive(self, message_id: int, compte_id: int, autre_id: int) -> dict | None:
+        with self.verrou:
+            return self._un(
+                "SELECT audio, audio_type FROM messages_prives "
+                "WHERE id = ? AND type = 'audio' "
+                "AND ((expediteur_id = ? AND destinataire_id = ?) "
+                "OR (expediteur_id = ? AND destinataire_id = ?))",
+                (message_id, compte_id, autre_id, autre_id, compte_id),
             )
 
     def marquer_messages_prives_lus(self, lecteur_id: int, expediteur_id: int) -> dict:

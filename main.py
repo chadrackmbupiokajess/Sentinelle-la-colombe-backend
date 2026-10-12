@@ -20,7 +20,7 @@ import os
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from base import Base, ErreurMetier, maintenant
@@ -70,6 +70,8 @@ lim_appel_lit = Limiteur(6, 600)  # 6 appels / 10 min / lit
 lim_appel_ip = Limiteur(30, 600)  # 30 appels / 10 min / IP (opérateurs mobiles : IP partagées)
 lim_code_faux_ip = Limiteur(20, 600)  # 20 codes de chambre faux / 10 min / IP
 lim_sejour_faux_ip = Limiteur(8, 900)  # 8 codes de séjour faux / 15 min / IP
+TAILLE_MAX_VOCAL = 5 * 1024 * 1024
+TYPES_AUDIO_AUTORISES = {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav"}
 
 MESSAGES_STATUT = {
     "libre": "Cette chambre n'est pas active. Demandez à l'infirmière d'activer votre accès.",
@@ -442,6 +444,45 @@ async def envoyer_message_prive(
     message = base.ajouter_message_prive(compte["id"], destinataire_id, donnees.texte)
     await diffuseur.a_un_compte(destinataire_id, {"type": "message_prive", "message": message})
     return message
+
+
+@app.post("/api/messages-prives/{destinataire_id}/vocaux", status_code=201)
+async def envoyer_vocal_prive(
+    destinataire_id: int, requete: Request, compte: dict = Depends(soignant)
+):
+    partenaire_medical(compte, destinataire_id)
+    audio_type = requete.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if audio_type not in TYPES_AUDIO_AUTORISES:
+        raise ErreurMetier("Format audio non pris en charge par ce navigateur.", 415)
+    longueur = requete.headers.get("content-length")
+    if longueur:
+        try:
+            taille_annoncee = int(longueur)
+        except ValueError as exc:
+            raise ErreurMetier("Taille de vocal invalide.", 400) from exc
+        if taille_annoncee > TAILLE_MAX_VOCAL:
+            raise ErreurMetier("Le vocal dépasse la taille maximale de 5 Mo.", 413)
+    audio = bytearray()
+    async for bloc in requete.stream():
+        if len(audio) + len(bloc) > TAILLE_MAX_VOCAL:
+            raise ErreurMetier("Le vocal dépasse la taille maximale de 5 Mo.", 413)
+        audio.extend(bloc)
+    message = base.ajouter_vocal_prive(compte["id"], destinataire_id, bytes(audio), audio_type)
+    await diffuseur.a_un_compte(destinataire_id, {"type": "message_prive", "message": message})
+    return message
+
+
+@app.get("/api/messages-prives/{autre_id}/vocaux/{message_id}")
+def lire_vocal_prive(autre_id: int, message_id: int, compte: dict = Depends(soignant)):
+    partenaire_medical(compte, autre_id)
+    vocal = base.vocal_prive(message_id, compte["id"], autre_id)
+    if not vocal or not vocal["audio"]:
+        raise ErreurMetier("Message vocal introuvable.", 404)
+    return Response(
+        content=vocal["audio"],
+        media_type=vocal["audio_type"],
+        headers={"Content-Disposition": "inline", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.post("/api/chambres/{chambre_id}/lits/{lit}/admission", status_code=201)
