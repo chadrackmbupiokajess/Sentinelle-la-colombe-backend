@@ -1,0 +1,41 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# environment files
+.env
+.env.*
+!.env.example
+
+# database files
+*.db
+*.sqlite3
+*.sqlite
+sentinelle.db
+sentinelle.db-shm
+sentinelle.db-wal
+
+# Python package artifacts
+build/
+dist/
+*.egg-info/
+.Python
+
+# test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# logs
+*.log
+
+# editors / OS
+.vscode/
+.DS_Store
