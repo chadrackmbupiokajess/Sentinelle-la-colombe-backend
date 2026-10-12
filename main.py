@@ -147,12 +147,25 @@ class Diffuseur:
     def equipe(self) -> list[str]:
         return sorted({c["nom"] for c in self.soignants.values()}, key=str.lower)
 
+    def contacts_connectes(self) -> list[dict]:
+        contacts = {
+            c["id"]: {
+                "id": c["id"],
+                "nom": c["nom"],
+                "role": "medecin" if c["role"] in ("medecin", "admin") else "infirmier",
+            }
+            for c in self.soignants.values()
+            if c["role"] in ("infirmier", "medecin", "admin")
+        }
+        return sorted(contacts.values(), key=lambda c: c["nom"].lower())
+
     def etat_soignants(self) -> dict:
         return {
             "type": "etat",
             "alertes": base.alertes_visibles(),
             "chambres": base.lister_chambres(avec_sejours=True),
             "equipe": self.equipe(),
+            "contacts_connectes": self.contacts_connectes(),
             "stats": base.statistiques(),
             "heure_serveur": maintenant().isoformat(timespec="milliseconds"),
         }
@@ -182,6 +195,11 @@ class Diffuseur:
     async def aux_soignants(self, donnees: dict) -> None:
         for ws in list(self.soignants):
             if not await self._envoyer(ws, donnees):
+                self.soignants.pop(ws, None)
+
+    async def a_un_compte(self, compte_id: int, donnees: dict) -> None:
+        for ws, compte in list(self.soignants.items()):
+            if compte["id"] == compte_id and not await self._envoyer(ws, donnees):
                 self.soignants.pop(ws, None)
 
     async def fermer_compte(self, compte_id: int) -> None:
@@ -378,6 +396,41 @@ async def envoyer_message(donnees: NouveauMessage, compte: dict = Depends(soigna
     return message
 
 
+def partenaire_medical(compte: dict, autre_id: int) -> dict:
+    def role_medical(role: str) -> str | None:
+        if role == "infirmier":
+            return "infirmier"
+        if role in ("medecin", "admin"):
+            return "medecin"
+        return None
+
+    role_compte = role_medical(compte["role"])
+    if role_compte is None:
+        raise ErreurMetier("La messagerie privée est réservée aux médecins et infirmiers.", 403)
+    autre = base.compte(autre_id)
+    if not autre or autre["statut"] != "actif":
+        raise ErreurMetier("Ce compte est introuvable ou indisponible.", 404)
+    if role_medical(autre["role"]) is None or role_medical(autre["role"]) == role_compte:
+        raise ErreurMetier("La messagerie privée relie un médecin et un infirmier.", 403)
+    return autre
+
+
+@app.get("/api/messages-prives/{autre_id}")
+def lister_messages_prives(autre_id: int, compte: dict = Depends(soignant)):
+    partenaire_medical(compte, autre_id)
+    return base.messages_prives(compte["id"], autre_id)
+
+
+@app.post("/api/messages-prives/{destinataire_id}", status_code=201)
+async def envoyer_message_prive(
+    destinataire_id: int, donnees: NouveauMessage, compte: dict = Depends(soignant)
+):
+    partenaire_medical(compte, destinataire_id)
+    message = base.ajouter_message_prive(compte["id"], destinataire_id, donnees.texte)
+    await diffuseur.a_un_compte(destinataire_id, {"type": "message_prive", "message": message})
+    return message
+
+
 @app.post("/api/chambres/{chambre_id}/lits/{lit}/admission", status_code=201)
 async def admission(chambre_id: str, lit: int, donnees: Admission, compte: dict = Depends(soignant)):
     """Admettre un patient sur un lit : renvoie le code de séjour à lui donner."""
@@ -430,6 +483,7 @@ async def admin_statut(compte_id: int, donnees: NouveauStatut, admin: dict = Dep
 async def admin_role(compte_id: int, donnees: NouveauRole, admin: dict = Depends(administrateur)):
     compte = base.changer_role(compte_id, donnees.role, admin)
     await diffuseur.fermer_compte(compte_id)  # se reconnecte avec ses nouveaux droits
+    await diffuseur.publier()
     return compte
 
 

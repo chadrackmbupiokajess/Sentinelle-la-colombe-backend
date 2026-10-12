@@ -135,6 +135,17 @@ class Base:
                     texte    TEXT NOT NULL,
                     cree_le  TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS messages_prives (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    expediteur_id   INTEGER NOT NULL REFERENCES comptes(id),
+                    destinataire_id INTEGER NOT NULL REFERENCES comptes(id),
+                    texte           TEXT NOT NULL,
+                    cree_le         TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_messages_prives_expediteur
+                    ON messages_prives(expediteur_id, destinataire_id, id);
+                CREATE INDEX IF NOT EXISTS idx_messages_prives_destinataire
+                    ON messages_prives(destinataire_id, expediteur_id, id);
                 CREATE TABLE IF NOT EXISTS comptes (
                     id             INTEGER PRIMARY KEY AUTOINCREMENT,
                     identifiant    TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -364,7 +375,7 @@ class Base:
             return _compte_public(self._un("SELECT * FROM comptes WHERE id = ?", (compte_id,)))
 
     def changer_role(self, compte_id: int, role: str, par: dict) -> dict:
-        if role not in ("infirmier", "admin"):
+        if role not in ("infirmier", "medecin", "admin"):
             raise ErreurMetier("Rôle inconnu.")
         with self.verrou, self.cx:
             ligne = self._exiger_compte(compte_id)
@@ -830,3 +841,36 @@ class Base:
                 (auteur[:60], texte, horodatage()),
             )
             return self._un("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,))
+
+    def messages_prives(self, compte_id: int, autre_id: int, limite: int = 100) -> list[dict]:
+        with self.verrou:
+            lignes = self._plusieurs(
+                "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
+                "m.destinataire_id, m.texte, m.cree_le "
+                "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
+                "WHERE (m.expediteur_id = ? AND m.destinataire_id = ?) "
+                "OR (m.expediteur_id = ? AND m.destinataire_id = ?) "
+                "ORDER BY m.id DESC LIMIT ?",
+                (compte_id, autre_id, autre_id, compte_id, limite),
+            )
+        return list(reversed(lignes))
+
+    def ajouter_message_prive(self, expediteur_id: int, destinataire_id: int, texte: str) -> dict:
+        texte = texte.strip()
+        if not texte:
+            raise ErreurMetier("Message vide.")
+        if len(texte) > 500:
+            raise ErreurMetier("Message trop long (500 caractères maximum).")
+        with self.verrou, self.cx:
+            cur = self.cx.execute(
+                "INSERT INTO messages_prives "
+                "(expediteur_id, destinataire_id, texte, cree_le) VALUES (?, ?, ?, ?)",
+                (expediteur_id, destinataire_id, texte, horodatage()),
+            )
+            return self._un(
+                "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
+                "m.destinataire_id, m.texte, m.cree_le "
+                "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
+                "WHERE m.id = ?",
+                (cur.lastrowid,),
+            )
