@@ -140,7 +140,8 @@ class Base:
                     expediteur_id   INTEGER NOT NULL REFERENCES comptes(id),
                     destinataire_id INTEGER NOT NULL REFERENCES comptes(id),
                     texte           TEXT NOT NULL,
-                    cree_le         TEXT NOT NULL
+                    cree_le         TEXT NOT NULL,
+                    lu_le           TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_expediteur
                     ON messages_prives(expediteur_id, destinataire_id, id);
@@ -202,6 +203,7 @@ class Base:
             ajouter_colonne("alertes", "lit", "INTEGER")
             ajouter_colonne("alertes", "sejour_id", "TEXT")
             ajouter_colonne("sejours", "sortie_prevue", "TEXT")
+            ajouter_colonne("messages_prives", "lu_le", "TEXT")
             if self.cx.execute("SELECT COUNT(*) FROM chambres").fetchone()[0] == 0:
                 self.cx.executemany(
                     "INSERT INTO chambres (id, libelle, service) VALUES (?, ?, ?)",
@@ -846,7 +848,7 @@ class Base:
         with self.verrou:
             lignes = self._plusieurs(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
-                "m.destinataire_id, m.texte, m.cree_le "
+                "m.destinataire_id, m.texte, m.cree_le, m.lu_le "
                 "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
                 "WHERE (m.expediteur_id = ? AND m.destinataire_id = ?) "
                 "OR (m.expediteur_id = ? AND m.destinataire_id = ?) "
@@ -869,8 +871,28 @@ class Base:
             )
             return self._un(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
-                "m.destinataire_id, m.texte, m.cree_le "
+                "m.destinataire_id, m.texte, m.cree_le, m.lu_le "
                 "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
                 "WHERE m.id = ?",
                 (cur.lastrowid,),
             )
+
+    def marquer_messages_prives_lus(self, lecteur_id: int, expediteur_id: int) -> dict:
+        with self.verrou, self.cx:
+            ids = [
+                ligne["id"]
+                for ligne in self._plusieurs(
+                    "SELECT id FROM messages_prives "
+                    "WHERE expediteur_id = ? AND destinataire_id = ? AND lu_le IS NULL",
+                    (expediteur_id, lecteur_id),
+                )
+            ]
+            if not ids:
+                return {"ids": [], "lu_le": None}
+            lu_le = horodatage()
+            placeholders = ",".join("?" for _ in ids)
+            self.cx.execute(
+                f"UPDATE messages_prives SET lu_le = ? WHERE id IN ({placeholders}) AND lu_le IS NULL",
+                (lu_le, *ids),
+            )
+            return {"ids": ids, "lu_le": lu_le}

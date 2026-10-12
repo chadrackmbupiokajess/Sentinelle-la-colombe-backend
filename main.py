@@ -422,6 +422,18 @@ def lister_messages_prives(autre_id: int, compte: dict = Depends(soignant)):
     return base.messages_prives(compte["id"], autre_id)
 
 
+@app.post("/api/messages-prives/{autre_id}/lu")
+async def marquer_messages_prives_lus(autre_id: int, compte: dict = Depends(soignant)):
+    partenaire_medical(compte, autre_id)
+    lecture = base.marquer_messages_prives_lus(compte["id"], autre_id)
+    if lecture["ids"]:
+        await diffuseur.a_un_compte(
+            autre_id,
+            {"type": "messages_prives_lus", **lecture},
+        )
+    return lecture
+
+
 @app.post("/api/messages-prives/{destinataire_id}", status_code=201)
 async def envoyer_message_prive(
     destinataire_id: int, donnees: NouveauMessage, compte: dict = Depends(soignant)
