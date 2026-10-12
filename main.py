@@ -160,7 +160,7 @@ class Diffuseur:
             for contact in base.contacts_medicaux()
         ]
 
-    def etat_soignants(self) -> dict:
+    def etat_soignants(self, compte_id: int) -> dict:
         return {
             "type": "etat",
             "alertes": base.alertes_visibles(),
@@ -169,6 +169,7 @@ class Diffuseur:
             "contacts_medicaux": self.contacts_medicaux(),
             "stats": base.statistiques(),
             "heure_serveur": maintenant().isoformat(timespec="milliseconds"),
+            "urgences_privees": base.urgences_actives(compte_id),
         }
 
     @staticmethod
@@ -184,10 +185,11 @@ class Diffuseur:
         }
 
     async def publier(self) -> None:
-        etat = self.etat_soignants()
-        etat_admin = {**etat, "demandes_en_attente": base.demandes_en_attente()}
         for ws, compte in list(self.soignants.items()):
-            if not await self._envoyer(ws, etat_admin if compte["role"] == "admin" else etat):
+            etat = self.etat_soignants(compte["id"])
+            if compte["role"] == "admin":
+                etat["demandes_en_attente"] = base.demandes_en_attente()
+            if not await self._envoyer(ws, etat):
                 self.soignants.pop(ws, None)
         for ws, (chambre_id, sejour) in list(self.bornes.items()):
             if not await self._envoyer(ws, self.etat_borne(chambre_id, sejour)):
@@ -445,6 +447,29 @@ async def envoyer_message_prive(
     return message
 
 
+@app.post("/api/messages-prives/{destinataire_id}/urgence", status_code=201)
+async def envoyer_urgence_privee(destinataire_id: int, compte: dict = Depends(soignant)):
+    partenaire_medical(compte, destinataire_id)
+    texte = "🚨 URGENCE — Vous êtes demandé(e)."
+    message = base.ajouter_message_prive(compte["id"], destinataire_id, texte)
+    # Persister l'état d'urgence pour permettre l'alerte continue et la reconnaissance ultérieure
+    base.ajouter_urgence(message["id"], destinataire_id)
+    await diffuseur.a_un_compte(
+        destinataire_id,
+        {"type": "message_prive", "message": message, "urgence": True},
+    )
+    urgence = next(
+        urgence
+        for urgence in base.urgences_actives(destinataire_id)
+        if urgence["message_id"] == message["id"]
+    )
+    await diffuseur.a_un_compte(
+        destinataire_id,
+        {"type": "urgence_debut", "urgence": urgence},
+    )
+    return message
+
+
 @app.post("/api/messages-prives/{destinataire_id}/vocaux", status_code=201)
 async def envoyer_vocal_prive(
     destinataire_id: int, requete: Request, compte: dict = Depends(soignant)
@@ -469,6 +494,25 @@ async def envoyer_vocal_prive(
     message = base.ajouter_vocal_prive(compte["id"], destinataire_id, bytes(audio), audio_type)
     await diffuseur.a_un_compte(destinataire_id, {"type": "message_prive", "message": message})
     return message
+
+
+@app.post("/api/messages-prives/{message_id}/jarrive", status_code=200)
+async def jarrive_message_prive(message_id: int, compte: dict = Depends(soignant)):
+    """Accusé 'J'arrive' pour clore une urgence liée à un message privé.
+    Seul le destinataire de l'urgence peut l'accuser."""
+    urgence = base.urgence_par_message(message_id)
+    if not urgence or not urgence.get("actif"):
+        raise ErreurMetier("Aucune urgence active pour ce message.", 400)
+    if urgence["destinataire_id"] != compte["id"]:
+        raise ErreurMetier("Vous n'êtes pas le destinataire de cette urgence.", 403)
+    fermeture = base.clore_urgence(message_id, compte["nom"])
+    # Notifier tous les soignants afin qu'ils arrêtent la sonnerie locale si nécessaire
+    await diffuseur.a_un_compte(
+        compte["id"],
+        {"type": "urgence_terminee", "message_id": message_id, "par": compte["nom"]},
+    )
+    await diffuseur.publier()
+    return {"ok": True, "fermeture": fermeture}
 
 
 @app.get("/api/messages-prives/{autre_id}/vocaux/{message_id}")

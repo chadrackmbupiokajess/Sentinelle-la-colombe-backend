@@ -146,6 +146,16 @@ class Base:
                     audio           BLOB,
                     audio_type      TEXT
                 );
+                CREATE TABLE IF NOT EXISTS urgences (
+                    message_id      INTEGER PRIMARY KEY REFERENCES messages_prives(id) ON DELETE CASCADE,
+                    destinataire_id INTEGER NOT NULL REFERENCES comptes(id),
+                    actif           INTEGER NOT NULL DEFAULT 1,
+                    cree_le         TEXT NOT NULL,
+                    ferme_par       TEXT,
+                    ferme_le        TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_urgences_destinataire_actif
+                    ON urgences(destinataire_id, actif);
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_expediteur
                     ON messages_prives(expediteur_id, destinataire_id, id);
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_destinataire
@@ -948,3 +958,46 @@ class Base:
                 (lu_le, *ids),
             )
             return {"ids": ids, "lu_le": lu_le}
+
+    # ------------------------------------------------------------------ URGENCES
+    def ajouter_urgence(self, message_id: int, destinataire_id: int) -> None:
+        """Créer une entrée d'urgence liée à un message privé (actif).
+        message_id : id dans messages_prives
+        destinataire_id : compte qui doit recevoir l'alerte"""
+        with self.verrou, self.cx:
+            self.cx.execute(
+                "INSERT OR REPLACE INTO urgences (message_id, destinataire_id, actif, cree_le) VALUES (?, ?, 1, ?)",
+                (message_id, destinataire_id, horodatage()),
+            )
+
+    def clore_urgence(self, message_id: int, ferme_par: str | None = None) -> dict | None:
+        with self.verrou, self.cx:
+            urgence = self._un(
+                "SELECT message_id, destinataire_id, actif, cree_le, ferme_par, ferme_le FROM urgences WHERE message_id = ?",
+                (message_id,),
+            )
+            if not urgence or not urgence.get("actif"):
+                return None
+            ferme_le = horodatage()
+            self.cx.execute(
+                "UPDATE urgences SET actif = 0, ferme_par = ?, ferme_le = ? WHERE message_id = ?",
+                (ferme_par, ferme_le, message_id),
+            )
+            return {**urgence, "ferme_par": ferme_par, "ferme_le": ferme_le}
+
+    def urgence_par_message(self, message_id: int) -> dict | None:
+        with self.verrou:
+            return self._un("SELECT * FROM urgences WHERE message_id = ?", (message_id,))
+
+    def urgences_actives(self, destinataire_id: int) -> list[dict]:
+        """Retourne les urgences actives destinées à un compte."""
+        with self.verrou:
+            lignes = self._plusieurs(
+                "SELECT u.message_id, u.destinataire_id, m.expediteur_id AS expediteur_id, "
+                "e.nom AS expediteur_nom, e.role AS expediteur_role, m.texte, m.cree_le "
+                "FROM urgences u JOIN messages_prives m ON m.id = u.message_id "
+                "JOIN comptes e ON e.id = m.expediteur_id "
+                "WHERE u.actif = 1 AND u.destinataire_id = ?",
+                (destinataire_id,),
+            )
+        return lignes
