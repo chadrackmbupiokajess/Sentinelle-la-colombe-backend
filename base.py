@@ -44,7 +44,9 @@ from securite import (
 CHEMIN_BD = os.environ.get(
     "SENTINELLE_BD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinelle.db")
 )
-DUREE_SESSION = timedelta(days=int(os.environ.get("SENTINELLE_SESSION_JOURS", "30")))
+_SESSION_JOURS = int(os.environ.get("SENTINELLE_SESSION_JOURS", "0"))
+DUREE_SESSION = timedelta(days=_SESSION_JOURS) if _SESSION_JOURS > 0 else None
+EXPIRATION_SESSION_PERMANENTE = "9999-12-31T23:59:59+00:00"
 # Un séjour oublié (sortie non enregistrée) expire seul au bout de ce délai.
 DUREE_SEJOUR = timedelta(days=int(os.environ.get("SENTINELLE_SEJOUR_JOURS", "30")))
 ESSAIS_CODE_SALLE_MAX = 25  # codes de séjour faux tolérés par salle avant blocage
@@ -156,6 +158,15 @@ class Base:
                 );
                 CREATE INDEX IF NOT EXISTS idx_urgences_destinataire_actif
                     ON urgences(destinataire_id, actif);
+                CREATE TABLE IF NOT EXISTS abonnements_push (
+                    endpoint    TEXT PRIMARY KEY,
+                    compte_id   INTEGER NOT NULL REFERENCES comptes(id) ON DELETE CASCADE,
+                    p256dh      TEXT NOT NULL,
+                    auth        TEXT NOT NULL,
+                    cree_le     TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_abonnements_push_compte
+                    ON abonnements_push(compte_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_expediteur
                     ON messages_prives(expediteur_id, destinataire_id, id);
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_destinataire
@@ -329,19 +340,24 @@ class Base:
     def creer_session(self, compte_id: int, appareil: str = "") -> str:
         jeton = nouveau_jeton()
         t = maintenant()
+        expire_le = (
+            horodatage(t + DUREE_SESSION)
+            if DUREE_SESSION is not None
+            else EXPIRATION_SESSION_PERMANENTE
+        )
         with self.verrou, self.cx:
             self.cx.execute(
                 "INSERT INTO sessions (empreinte, compte_id, cree_le, vu_le, expire_le, appareil) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (empreinte_jeton(jeton), compte_id, horodatage(t), horodatage(t),
-                 horodatage(t + DUREE_SESSION), appareil[:120]),
+                 expire_le, appareil[:120]),
             )
             # Ménage : sessions expirées.
             self.cx.execute("DELETE FROM sessions WHERE expire_le < ?", (horodatage(t),))
         return jeton
 
     def compte_par_jeton(self, jeton: str | None) -> dict | None:
-        """Compte actif lié au jeton, ou None. Prolonge la session (30 jours glissants)."""
+        """Compte actif lié au jeton, ou None. Renouvelle l'expiration selon la configuration."""
         if not jeton:
             return None
         empreinte = empreinte_jeton(jeton)
@@ -355,10 +371,15 @@ class Base:
             if not ligne or lire_date(ligne["expire_le"]) < t or ligne["statut"] != "actif":
                 return None
             if t - lire_date(ligne["vu_le"]) > timedelta(hours=1):
+                expire_le = (
+                    horodatage(t + DUREE_SESSION)
+                    if DUREE_SESSION is not None
+                    else EXPIRATION_SESSION_PERMANENTE
+                )
                 with self.cx:
                     self.cx.execute(
                         "UPDATE sessions SET vu_le = ?, expire_le = ? WHERE empreinte = ?",
-                        (horodatage(t), horodatage(t + DUREE_SESSION), empreinte),
+                        (horodatage(t), expire_le, empreinte),
                     )
         return _compte_public(ligne)
 
@@ -369,6 +390,32 @@ class Base:
     def supprimer_sessions_compte(self, compte_id: int) -> None:
         with self.verrou, self.cx:
             self.cx.execute("DELETE FROM sessions WHERE compte_id = ?", (compte_id,))
+
+    def enregistrer_abonnement_push(
+        self, compte_id: int, endpoint: str, p256dh: str, auth: str
+    ) -> None:
+        with self.verrou, self.cx:
+            self.cx.execute(
+                "INSERT INTO abonnements_push (endpoint, compte_id, p256dh, auth, cree_le) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(endpoint) DO UPDATE SET compte_id = excluded.compte_id, "
+                "p256dh = excluded.p256dh, auth = excluded.auth, cree_le = excluded.cree_le",
+                (endpoint, compte_id, p256dh, auth, horodatage()),
+            )
+
+    def abonnements_push_compte(self, compte_id: int) -> list[dict]:
+        with self.verrou:
+            return self._plusieurs(
+                "SELECT endpoint, p256dh, auth FROM abonnements_push WHERE compte_id = ?",
+                (compte_id,),
+            )
+
+    def supprimer_abonnement_push(self, compte_id: int, endpoint: str) -> None:
+        with self.verrou, self.cx:
+            self.cx.execute(
+                "DELETE FROM abonnements_push WHERE compte_id = ? AND endpoint = ?",
+                (compte_id, endpoint),
+            )
 
     # ---------------------------------------------------------- administration
     def lister_comptes(self) -> list[dict]:

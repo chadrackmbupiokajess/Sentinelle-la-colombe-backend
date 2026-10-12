@@ -4,7 +4,7 @@ Sentinelle — API temps réel d'appel malade.
   • Bornes patient   : /c/{chambre}-{code}  →  WebSocket /ws/borne/{jeton}, routes /api/bornes/…
                         (le code imprimé sur la porte empêche d'appeler depuis n'importe quelle chambre ;
                         le code de séjour, donné à l'admission, cesse de fonctionner à la sortie)
-  • Soignants        : comptes personnels (identifiant + mot de passe), session mémorisée 30 jours
+  • Soignants        : comptes personnels (identifiant + mot de passe), session mémorisée jusqu'à déconnexion
                         WebSocket /ws/soignant?jeton=…, routes /api/… protégées
   • Administrateurs  : validation des comptes, chambres, codes QR  →  /api/admin/…
 
@@ -16,12 +16,16 @@ Lancement local :  python main.py      (ou  uvicorn main:app --host 0.0.0.0 --po
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
+from py_vapid import Vapid
+from pywebpush import WebPushException, webpush
 
 from base import Base, ErreurMetier, maintenant
 from securite import Limiteur
@@ -54,6 +58,44 @@ async def entetes_securite(request: Request, suivant):
 
 
 base = Base()
+logger = logging.getLogger("sentinelle.push")
+VAPID_PUBLIC_KEY = os.environ.get("SENTINELLE_VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("SENTINELLE_VAPID_PRIVATE_KEY", "").strip()
+try:
+    if VAPID_PRIVATE_KEY:
+        Vapid.from_string(VAPID_PRIVATE_KEY)
+except (ValueError, TypeError):
+    logger.error("La clé privée VAPID n'est pas valide.")
+    VAPID_PRIVATE_KEY = ""
+VAPID_SUBJECT = os.environ.get("SENTINELLE_VAPID_SUBJECT", "").strip()
+
+
+async def envoyer_push_abonnement(abonnement: dict, donnees: dict) -> None:
+    if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT):
+        logger.warning("Push indisponible : clés VAPID non configurées.")
+        return
+    try:
+        await asyncio.to_thread(
+            webpush,
+            subscription_info={
+                "endpoint": abonnement["endpoint"],
+                "keys": {"p256dh": abonnement["p256dh"], "auth": abonnement["auth"]},
+            },
+            data=json.dumps(donnees, ensure_ascii=False),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": VAPID_SUBJECT},
+            ttl=86400 if donnees.get("type") in ("urgence", "urgence_terminee") else 300,
+        )
+    except WebPushException as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        logger.warning("Échec push vers un abonnement (HTTP %s): %s", status, exc)
+        if status in (404, 410):
+            base.supprimer_abonnement_push(abonnement["compte_id"], abonnement["endpoint"])
+
+
+async def envoyer_push_compte(compte_id: int, donnees: dict) -> None:
+    for abonnement in base.abonnements_push_compte(compte_id):
+        await envoyer_push_abonnement({**abonnement, "compte_id": compte_id}, donnees)
 
 
 @app.exception_handler(ErreurMetier)
@@ -312,6 +354,20 @@ class NouveauMessage(BaseModel):
     texte: str = Field(min_length=1, max_length=500)
 
 
+class ClesPush(BaseModel):
+    p256dh: str = Field(min_length=20, max_length=256)
+    auth: str = Field(min_length=8, max_length=128)
+
+
+class AbonnementPush(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+    keys: ClesPush
+
+
+class SuppressionAbonnementPush(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+
+
 # --------------------------------------------------------------------------
 # Routes : généralités et authentification
 # --------------------------------------------------------------------------
@@ -322,7 +378,49 @@ def sante():
 
 @app.get("/api/config")
 def config():
-    return {"premier_compte": base.nombre_comptes() == 0}
+    return {
+        "premier_compte": base.nombre_comptes() == 0,
+        "vapid_public_key": (
+            VAPID_PUBLIC_KEY
+            if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT
+            else None
+        ),
+    }
+
+
+@app.post("/api/push/abonnement", status_code=201)
+async def enregistrer_abonnement_push(donnees: AbonnementPush, compte: dict = Depends(soignant)):
+    if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT):
+        raise ErreurMetier("Les notifications push ne sont pas configurées sur le serveur.", 503)
+    if not donnees.endpoint.startswith("https://"):
+        raise ErreurMetier("Adresse d'abonnement push invalide.", 400)
+    base.enregistrer_abonnement_push(
+        compte["id"], donnees.endpoint, donnees.keys.p256dh, donnees.keys.auth
+    )
+    abonnement = {
+        "endpoint": donnees.endpoint,
+        "p256dh": donnees.keys.p256dh,
+        "auth": donnees.keys.auth,
+        "compte_id": compte["id"],
+    }
+    for urgence in base.urgences_actives(compte["id"]):
+        await envoyer_push_abonnement(
+            abonnement,
+            {
+                "type": "urgence",
+                "tag": f"urgence-privee-{urgence['message_id']}",
+                "titre": f"🚨 Urgence — {urgence['expediteur_nom']} ({'Infirmier' if urgence['expediteur_role'] == 'infirmier' else 'Médecin'})",
+                "corps": "Vous êtes demandé(e). Ouvrez Sentinelle puis appuyez sur « J'arrive ».",
+                "url": "/infirmier",
+                "message_id": urgence["message_id"],
+            },
+        )
+    return {"ok": True}
+
+
+@app.delete("/api/push/abonnement", status_code=204)
+def supprimer_abonnement_push(donnees: SuppressionAbonnementPush, compte: dict = Depends(soignant)):
+    base.supprimer_abonnement_push(compte["id"], donnees.endpoint)
 
 
 @app.post("/api/auth/inscription", status_code=201)
@@ -467,6 +565,17 @@ async def envoyer_urgence_privee(destinataire_id: int, compte: dict = Depends(so
         destinataire_id,
         {"type": "urgence_debut", "urgence": urgence},
     )
+    await envoyer_push_compte(
+        destinataire_id,
+        {
+            "type": "urgence",
+            "tag": f"urgence-privee-{message['id']}",
+            "titre": f"🚨 Urgence — {compte['nom']} ({'Infirmier' if compte['role'] == 'infirmier' else 'Médecin'})",
+            "corps": "Vous êtes demandé(e). Ouvrez Sentinelle puis appuyez sur « J'arrive ».",
+            "url": "/infirmier",
+            "message_id": message["id"],
+        },
+    )
     return message
 
 
@@ -510,6 +619,10 @@ async def jarrive_message_prive(message_id: int, compte: dict = Depends(soignant
     await diffuseur.a_un_compte(
         compte["id"],
         {"type": "urgence_terminee", "message_id": message_id, "par": compte["nom"]},
+    )
+    await envoyer_push_compte(
+        compte["id"],
+        {"type": "urgence_terminee", "tag": f"urgence-privee-{message_id}"},
     )
     await diffuseur.publier()
     return {"ok": True, "fermeture": fermeture}
@@ -697,10 +810,13 @@ async def annuler(jeton: str, requete: Request):
 # --------------------------------------------------------------------------
 # WebSockets
 # --------------------------------------------------------------------------
-async def _garder_ouvert(ws: WebSocket) -> None:
+async def _garder_ouvert(ws: WebSocket, jeton: str) -> None:
     """Lit (et ignore) les « ping » du client jusqu'à la déconnexion."""
     while True:
         await ws.receive_text()
+        if not base.compte_par_jeton(jeton):
+            await ws.close(code=4401, reason="Session expirée")
+            return
 
 
 @app.websocket("/ws/soignant")
@@ -715,7 +831,7 @@ async def ws_soignant(ws: WebSocket):
         await ws.send_json({"type": "moi", "compte": compte})
         await ws.send_json({"type": "messages", "messages": base.messages()})
         await diffuseur.publier()  # met aussi à jour la liste « équipe » des collègues
-        await _garder_ouvert(ws)
+        await _garder_ouvert(ws, ws.query_params.get("jeton", ""))
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
