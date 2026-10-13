@@ -810,11 +810,11 @@ async def annuler(jeton: str, requete: Request):
 # --------------------------------------------------------------------------
 # WebSockets
 # --------------------------------------------------------------------------
-async def _garder_ouvert(ws: WebSocket, jeton: str) -> None:
+async def _garder_ouvert(ws: WebSocket, jeton: str | None = None) -> None:
     """Lit (et ignore) les « ping » du client jusqu'à la déconnexion."""
     while True:
         await ws.receive_text()
-        if not base.compte_par_jeton(jeton):
+        if jeton is not None and not base.compte_par_jeton(jeton):
             await ws.close(code=4401, reason="Session expirée")
             return
 
