@@ -191,6 +191,9 @@ class Diffuseur:
     def equipe(self) -> list[str]:
         return sorted({c["nom"] for c in self.soignants.values()}, key=str.lower)
 
+    def compte_en_ligne(self, compte_id: int) -> bool:
+        return any(compte["id"] == compte_id for compte in self.soignants.values())
+
     def contacts_medicaux(self) -> list[dict]:
         comptes_connectes = {
             compte["id"]
@@ -548,6 +551,9 @@ async def envoyer_message_prive(
 @app.post("/api/messages-prives/{destinataire_id}/urgence", status_code=201)
 async def envoyer_urgence_privee(destinataire_id: int, compte: dict = Depends(soignant)):
     partenaire_medical(compte, destinataire_id)
+    if not diffuseur.compte_en_ligne(destinataire_id):
+        return base.ajouter_appel_manque(compte["id"], destinataire_id)
+
     texte = "🚨 URGENCE — Vous êtes demandé(e)."
     message = base.ajouter_message_prive(compte["id"], destinataire_id, texte)
     # Persister l'état d'urgence pour permettre l'alerte continue et la reconnaissance ultérieure
@@ -811,9 +817,11 @@ async def annuler(jeton: str, requete: Request):
 # WebSockets
 # --------------------------------------------------------------------------
 async def _garder_ouvert(ws: WebSocket, jeton: str | None = None) -> None:
-    """Lit (et ignore) les « ping » du client jusqu'à la déconnexion."""
+    """Répond aux pings client et vérifie toujours la session soignante."""
     while True:
-        await ws.receive_text()
+        message = await ws.receive_text()
+        if message == "ping":
+            await ws.send_text("pong")
         if jeton is not None and not base.compte_par_jeton(jeton):
             await ws.close(code=4401, reason="Session expirée")
             return
@@ -830,6 +838,10 @@ async def ws_soignant(ws: WebSocket):
     try:
         await ws.send_json({"type": "moi", "compte": compte})
         await ws.send_json({"type": "messages", "messages": base.messages()})
+        for message in base.appels_manques_non_lus(compte["id"]):
+            await ws.send_json(
+                {"type": "message_prive", "message": message, "urgence": False, "silencieux": True}
+            )
         await diffuseur.publier()  # met aussi à jour la liste « équipe » des collègues
         await _garder_ouvert(ws, ws.query_params.get("jeton", ""))
     except (WebSocketDisconnect, RuntimeError):

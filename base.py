@@ -936,17 +936,38 @@ class Base:
             )
         return list(reversed(lignes))
 
+    def appels_manques_non_lus(self, destinataire_id: int) -> list[dict]:
+        with self.verrou:
+            return self._plusieurs(
+                "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
+                "m.destinataire_id, m.texte, m.cree_le, m.lu_le, m.type, m.audio_type "
+                "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
+                "WHERE m.destinataire_id = ? AND m.type = 'appel_manque' AND m.lu_le IS NULL "
+                "ORDER BY m.id",
+                (destinataire_id,),
+            )
+
     def ajouter_message_prive(self, expediteur_id: int, destinataire_id: int, texte: str) -> dict:
+        return self._ajouter_message_prive(expediteur_id, destinataire_id, texte, "texte")
+
+    def ajouter_appel_manque(self, expediteur_id: int, destinataire_id: int) -> dict:
+        return self._ajouter_message_prive(expediteur_id, destinataire_id, "Appel manqué", "appel_manque")
+
+    def _ajouter_message_prive(
+        self, expediteur_id: int, destinataire_id: int, texte: str, type_message: str
+    ) -> dict:
         texte = texte.strip()
         if not texte:
             raise ErreurMetier("Message vide.")
         if len(texte) > 500:
             raise ErreurMetier("Message trop long (500 caractères maximum).")
+        if type_message not in ("texte", "appel_manque"):
+            raise ErreurMetier("Type de message privé invalide.")
         with self.verrou, self.cx:
             cur = self.cx.execute(
                 "INSERT INTO messages_prives "
-                "(expediteur_id, destinataire_id, texte, cree_le) VALUES (?, ?, ?, ?)",
-                (expediteur_id, destinataire_id, texte, horodatage()),
+                "(expediteur_id, destinataire_id, texte, cree_le, type) VALUES (?, ?, ?, ?, ?)",
+                (expediteur_id, destinataire_id, texte, horodatage(), type_message),
             )
             return self._un(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
