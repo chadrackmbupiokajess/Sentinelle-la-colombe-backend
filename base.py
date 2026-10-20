@@ -110,9 +110,7 @@ class Base:
     # ------------------------------------------------------------------ schéma
     def _creer_schema(self) -> None:
         with self.verrou, self.cx:
-            self.cx.executescript(
-                """
-                PRAGMA journal_mode = WAL;
+            script = """
                 CREATE TABLE IF NOT EXISTS chambres (
                     id       TEXT PRIMARY KEY,
                     libelle  TEXT NOT NULL,
@@ -131,6 +129,19 @@ class Base:
                 );
                 CREATE INDEX IF NOT EXISTS idx_alertes_statut  ON alertes(statut);
                 CREATE INDEX IF NOT EXISTS idx_alertes_chambre ON alertes(chambre_id);
+                CREATE TABLE IF NOT EXISTS comptes (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    identifiant    TEXT NOT NULL UNIQUE,
+                    nom            TEXT NOT NULL,
+                    mot_de_passe   TEXT NOT NULL,
+                    role           TEXT NOT NULL DEFAULT 'infirmier',
+                    statut         TEXT NOT NULL DEFAULT 'en_attente',
+                    cree_le        TEXT NOT NULL,
+                    valide_par     TEXT,
+                    echecs         INTEGER NOT NULL DEFAULT 0,
+                    bloque_jusqua  TEXT,
+                    doit_changer   INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS messages (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
                     auteur   TEXT NOT NULL,
@@ -171,19 +182,6 @@ class Base:
                     ON messages_prives(expediteur_id, destinataire_id, id);
                 CREATE INDEX IF NOT EXISTS idx_messages_prives_destinataire
                     ON messages_prives(destinataire_id, expediteur_id, id);
-                CREATE TABLE IF NOT EXISTS comptes (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    identifiant    TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                    nom            TEXT NOT NULL,
-                    mot_de_passe   TEXT NOT NULL,
-                    role           TEXT NOT NULL DEFAULT 'infirmier',
-                    statut         TEXT NOT NULL DEFAULT 'en_attente',
-                    cree_le        TEXT NOT NULL,
-                    valide_par     TEXT,
-                    echecs         INTEGER NOT NULL DEFAULT 0,
-                    bloque_jusqua  TEXT,
-                    doit_changer   INTEGER NOT NULL DEFAULT 0
-                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     empreinte  TEXT PRIMARY KEY,
                     compte_id  INTEGER NOT NULL REFERENCES comptes(id) ON DELETE CASCADE,
@@ -213,12 +211,15 @@ class Base:
                 );
                 CREATE INDEX IF NOT EXISTS idx_appareils_sejour ON appareils_patient(sejour_id);
                 """
-            )
+            self.cx.executescript(script)
             # Migrations : bases créées par les versions précédentes.
             def ajouter_colonne(table: str, colonne: str, definition: str) -> None:
                 colonnes = {l["name"] for l in self.cx.execute(f"PRAGMA table_info({table})")}
                 if colonne not in colonnes:
-                    self.cx.execute(f"ALTER TABLE {table} ADD COLUMN {colonne} {definition}")
+                    self.cx.execute(
+                        f"ALTER TABLE {table} ADD COLUMN "
+                        f"{colonne} {definition}"
+                    )
 
             ajouter_colonne("chambres", "code", "TEXT")
             ajouter_colonne("chambres", "lits", f"INTEGER NOT NULL DEFAULT {LITS_PAR_DEFAUT}")
@@ -308,7 +309,8 @@ class Base:
                     horodatage(),
                 ),
             )
-            return _compte_public(self._un("SELECT * FROM comptes WHERE id = ?", (cur.lastrowid,))), premier
+            nouvel_id = cur.lastrowid
+            return _compte_public(self._un("SELECT * FROM comptes WHERE id = ?", (nouvel_id,))), premier
 
     def authentifier(self, identifiant: str, mot_de_passe: str) -> dict:
         identifiant = identifiant.strip().lower()
@@ -921,7 +923,8 @@ class Base:
                 "INSERT INTO messages (auteur, texte, cree_le) VALUES (?, ?, ?)",
                 (auteur[:60], texte, horodatage()),
             )
-            return self._un("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,))
+            nouvel_id = cur.lastrowid
+            return self._un("SELECT * FROM messages WHERE id = ?", (nouvel_id,))
 
     def messages_prives(self, compte_id: int, autre_id: int, limite: int = 100) -> list[dict]:
         with self.verrou:
@@ -969,12 +972,13 @@ class Base:
                 "(expediteur_id, destinataire_id, texte, cree_le, type) VALUES (?, ?, ?, ?, ?)",
                 (expediteur_id, destinataire_id, texte, horodatage(), type_message),
             )
+            nouvel_id = cur.lastrowid
             return self._un(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
                 "m.destinataire_id, m.texte, m.cree_le, m.lu_le, m.type, m.audio_type "
                 "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
                 "WHERE m.id = ?",
-                (cur.lastrowid,),
+                (nouvel_id,),
             )
 
     def ajouter_vocal_prive(
@@ -989,12 +993,13 @@ class Base:
                 "VALUES (?, ?, '', ?, 'audio', ?, ?)",
                 (expediteur_id, destinataire_id, horodatage(), sqlite3.Binary(audio), audio_type),
             )
+            nouvel_id = cur.lastrowid
             return self._un(
                 "SELECT m.id, m.expediteur_id, e.nom AS expediteur_nom, "
                 "m.destinataire_id, m.texte, m.cree_le, m.lu_le, m.type, m.audio_type "
                 "FROM messages_prives m JOIN comptes e ON e.id = m.expediteur_id "
                 "WHERE m.id = ?",
-                (cur.lastrowid,),
+                (nouvel_id,),
             )
 
     def vocal_prive(self, message_id: int, compte_id: int, autre_id: int) -> dict | None:
