@@ -7,10 +7,13 @@ Sentinelle — API temps réel d'appel malade.
   • Soignants        : comptes personnels (identifiant + mot de passe), session mémorisée jusqu'à déconnexion
                         WebSocket /ws/soignant?jeton=…, routes /api/… protégées
   • Administrateurs  : validation des comptes, chambres, codes QR  →  /api/admin/…
+  • Secours AJAX      : /api/temps-reel/soignant et /api/temps-reel/borne/{jeton}
+                        pour les écrans (ou hébergeurs) sans WebSocket — voir temps_reel.py
 
 À chaque changement, l'état complet est rediffusé à tous les écrans concernés.
 
 Lancement local :  python main.py      (ou  uvicorn main:app --host 0.0.0.0 --port 8000)
+Hébergeur WSGI (PythonAnywhere) : voir wsgi.py
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +33,7 @@ from pywebpush import WebPushException, webpush
 
 from base import Base, ErreurMetier, maintenant
 from securite import Limiteur
+from temps_reel import TempsReel
 
 documentation = os.environ.get("SENTINELLE_DOCS", "1") != "0"
 app = FastAPI(
@@ -58,6 +63,7 @@ async def entetes_securite(request: Request, suivant):
 
 
 base = Base()
+temps_reel = TempsReel(base)
 logger = logging.getLogger("sentinelle.push")
 VAPID_PUBLIC_KEY = os.environ.get("SENTINELLE_VAPID_PUBLIC_KEY", "").strip()
 VAPID_PRIVATE_KEY = os.environ.get("SENTINELLE_VAPID_PRIVATE_KEY", "").strip()
@@ -176,6 +182,9 @@ def borne(jeton: str, requete: Request) -> dict:
 # Diffusion temps réel
 # --------------------------------------------------------------------------
 class Diffuseur:
+    """Envoie les mises à jour aux écrans connectés en WebSocket, et les inscrit
+    au journal pour ceux qui fonctionnent en AJAX (voir temps_reel.py)."""
+
     def __init__(self) -> None:
         self.soignants: dict[WebSocket, dict] = {}  # socket -> compte
         self.bornes: dict[WebSocket, tuple[str, str | None]] = {}  # socket -> (chambre, jeton de séjour)
@@ -188,16 +197,23 @@ class Diffuseur:
         except Exception:
             return False
 
+    def comptes_en_ligne(self) -> dict[int, dict]:
+        """Soignants connectés, en WebSocket ou en AJAX : id -> compte."""
+        en_ligne = {compte["id"]: compte for compte in temps_reel.presents()}
+        for compte in self.soignants.values():
+            en_ligne[compte["id"]] = compte
+        return en_ligne
+
     def equipe(self) -> list[str]:
-        return sorted({c["nom"] for c in self.soignants.values()}, key=str.lower)
+        return sorted({c["nom"] for c in self.comptes_en_ligne().values()}, key=str.lower)
 
     def compte_en_ligne(self, compte_id: int) -> bool:
-        return any(compte["id"] == compte_id for compte in self.soignants.values())
+        return compte_id in self.comptes_en_ligne()
 
     def contacts_medicaux(self) -> list[dict]:
         comptes_connectes = {
             compte["id"]
-            for compte in self.soignants.values()
+            for compte in self.comptes_en_ligne().values()
             if compte["role"] in ("infirmier", "medecin", "admin")
         }
         return [
@@ -229,29 +245,38 @@ class Diffuseur:
             "heure_serveur": maintenant().isoformat(timespec="milliseconds"),
         }
 
+    def etat_pour(self, compte: dict) -> dict:
+        etat = self.etat_soignants(compte["id"])
+        if compte["role"] == "admin":
+            etat["demandes_en_attente"] = base.demandes_en_attente()
+        return etat
+
     async def publier(self) -> None:
+        # Pas de journal ici : en AJAX, l'état complet est renvoyé à chaque requête.
         for ws, compte in list(self.soignants.items()):
-            etat = self.etat_soignants(compte["id"])
-            if compte["role"] == "admin":
-                etat["demandes_en_attente"] = base.demandes_en_attente()
-            if not await self._envoyer(ws, etat):
+            if not await self._envoyer(ws, self.etat_pour(compte)):
                 self.soignants.pop(ws, None)
         for ws, (chambre_id, sejour) in list(self.bornes.items()):
             if not await self._envoyer(ws, self.etat_borne(chambre_id, sejour)):
                 self.bornes.pop(ws, None)
 
     async def aux_soignants(self, donnees: dict) -> None:
+        temps_reel.publier(donnees)
         for ws in list(self.soignants):
             if not await self._envoyer(ws, donnees):
                 self.soignants.pop(ws, None)
 
     async def a_un_compte(self, compte_id: int, donnees: dict) -> None:
+        temps_reel.publier(donnees, compte_id)
         for ws, compte in list(self.soignants.items()):
             if compte["id"] == compte_id and not await self._envoyer(ws, donnees):
                 self.soignants.pop(ws, None)
 
     async def fermer_compte(self, compte_id: int) -> None:
         """Déconnecte immédiatement tous les écrans d'un compte (désactivé, mot de passe réinitialisé…)."""
+        # Écrans en AJAX : même effet qu'une fermeture de WebSocket avec le code 4401.
+        temps_reel.publier({"type": "_fermeture", "code": 4401}, compte_id)
+        temps_reel.retirer(compte_id)
         for ws, compte in list(self.soignants.items()):
             if compte["id"] == compte_id:
                 self.soignants.pop(ws, None)
@@ -297,8 +322,26 @@ async def _boucle_sorties_automatiques() -> None:
         await asyncio.sleep(30)
 
 
+_derniere_verification = 0.0
+
+
+async def verifier_sorties_si_necessaire() -> None:
+    """Appelée à chaque requête AJAX : remplace la boucle ci-dessus quand l'hébergeur
+    ne garde pas de tâche de fond (WSGI, PythonAnywhere). Au plus une fois par 30 s."""
+    global _derniere_verification
+    t = time.monotonic()
+    if t - _derniere_verification < 30:
+        return
+    _derniere_verification = t
+    try:
+        await verifier_sorties_automatiques()
+    except Exception as e:  # ne jamais faire échouer la requête pour autant
+        print("Sorties automatiques :", e)
+
+
 @app.on_event("startup")
 async def demarrer_taches() -> None:
+    # Serveur ASGI (uvicorn) seulement : en WSGI, ce démarrage n'a pas lieu.
     asyncio.create_task(_boucle_sorties_automatiques())
 
 
@@ -376,7 +419,12 @@ class SuppressionAbonnementPush(BaseModel):
 # --------------------------------------------------------------------------
 @app.get("/api/sante")
 def sante():
-    return {"ok": True, "soignants_connectes": len(diffuseur.soignants), "bornes": len(diffuseur.bornes)}
+    return {
+        "ok": True,
+        "soignants_connectes": len(diffuseur.soignants),
+        "soignants_ajax": len(temps_reel.presents()),
+        "bornes": len(diffuseur.bornes),
+    }
 
 
 @app.get("/api/config")
@@ -457,7 +505,10 @@ def moi(compte: dict = Depends(soignant)):
 def deconnexion(requete: Request):
     jeton = jeton_de(requete)
     if jeton:
+        compte = base.compte_par_jeton(jeton)
         base.supprimer_session(jeton)
+        if compte:
+            temps_reel.retirer(compte["id"])
 
 
 @app.post("/api/auth/mot-de-passe", status_code=204)
@@ -811,6 +862,44 @@ async def annuler(jeton: str, requete: Request):
             {"type": "info", "texte": f"{alerte['chambre_libelle']}, lit {alerte['lit']} : appel annulé par le patient."}
         )
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Temps réel par AJAX (secours des WebSockets) — voir temps_reel.py
+# Les messages renvoyés sont exactement ceux qu'enverrait le WebSocket.
+# --------------------------------------------------------------------------
+@app.get("/api/temps-reel/soignant")
+async def sondage_soignant(requete: Request, curseur: int | None = None):
+    jeton = jeton_de(requete) or requete.query_params.get("jeton")
+    compte = base.compte_par_jeton(jeton)
+    if not compte:
+        raise ErreurMetier("Session expirée. Reconnectez-vous.", 401)
+    await verifier_sorties_si_necessaire()
+    if temps_reel.marquer_present(compte["id"]):
+        await diffuseur.publier()  # collègues en WebSocket : liste « équipe » à jour
+    if curseur is None:
+        # Première requête : mêmes messages qu'à l'ouverture du WebSocket.
+        curseur = temps_reel.dernier_id()
+        evenements: list[dict] = [
+            {"type": "moi", "compte": compte},
+            {"type": "messages", "messages": base.messages()},
+            *(
+                {"type": "message_prive", "message": message, "urgence": False, "silencieux": True}
+                for message in base.appels_manques_non_lus(compte["id"])
+            ),
+        ]
+    else:
+        evenements, curseur = temps_reel.depuis(curseur, compte["id"])
+    evenements.append(diffuseur.etat_pour(compte))
+    return {"curseur": curseur, "evenements": evenements}
+
+
+@app.get("/api/temps-reel/borne/{jeton}")
+async def sondage_borne(jeton: str, requete: Request):
+    chambre = borne(jeton, requete)  # 404 si le code de chambre n'est plus valide
+    await verifier_sorties_si_necessaire()
+    sejour = jeton_sejour(requete) or requete.query_params.get("sejour") or None
+    return {"curseur": None, "evenements": [diffuseur.etat_borne(chambre["id"], sejour)]}
 
 
 # --------------------------------------------------------------------------

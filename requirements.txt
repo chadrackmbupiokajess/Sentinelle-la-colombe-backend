@@ -1,3 +1,5 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pywebpush>=2.0,<3
+# Hébergement WSGI (PythonAnywhere) : fait tourner FastAPI sans serveur ASGI
+a2wsgi>=1.10
